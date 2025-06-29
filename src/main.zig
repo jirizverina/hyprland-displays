@@ -45,7 +45,6 @@ pub fn main() !void {
     var pool: *c.wl_shm_pool = undefined;
     var xdg_surface: *c.xdg_surface = undefined;
 
-    std.debug.print("shell interface name = {s}\n", .{c.wl_shell_interface.name});
     try setupWayland();
     const size = width * height * pixel_size;
     const file = try createFile(allocator, size);
@@ -66,6 +65,7 @@ pub fn main() !void {
 
     while (!done) {
         if (c.wl_display_dispatch(display) < 0) {
+            done = true;
             return WaylandError.DisplayDispatch;
         }
     }
@@ -117,9 +117,10 @@ fn createMemoryPool(allocator: std.mem.Allocator, file_handle: std.fs.File.Handl
     data.*.capacity = file_size;
     data.*.size = 0;
     data.*.fd = file_handle;
-    data.*.memory = try std.posix.mmap(null, data.*.capacity, std.posix.PROT.READ, std.posix.MAP{ .TYPE = .SHARED }, data.*.fd, 0);
+    data.*.memory = try std.posix.mmap(null, data.*.capacity, std.posix.PROT.READ | std.posix.PROT.WRITE, std.posix.MAP{ .TYPE = .SHARED }, data.*.fd, 0);
 
     errdefer std.posix.munmap(data.*.memory);
+    paint(data.*.memory);
 
     if (c.wl_shm_create_pool(shm, data.*.fd, @as(i32, @intCast(data.*.capacity)))) |pool| {
         c.wl_shm_pool_set_user_data(pool, data);
@@ -130,7 +131,6 @@ fn createMemoryPool(allocator: std.mem.Allocator, file_handle: std.fs.File.Handl
 }
 
 fn freeMemoryPool(allocator: std.mem.Allocator, pool: *c.wl_shm_pool) void {
-    std.debug.print("free memory pool: {any}", .{pool});
     const data: *PoolData = @ptrCast(@alignCast(c.wl_shm_pool_get_user_data(pool).?));
     c.wl_shm_pool_destroy(pool);
     std.posix.munmap(data.*.memory);
@@ -232,13 +232,16 @@ fn pointerEnter(data: ?*anyopaque, wl_pointer: ?*c.wl_pointer, serial: u32, surf
     _ = data;
     _ = surface_x;
     _ = surface_y;
+    _ = wl_pointer;
+    _ = serial;
+    _ = surface;
 
-    const pointer_data: *PointerData = @ptrCast(@alignCast(c.wl_pointer_get_user_data(wl_pointer).?));
-    pointer_data.*.target_surface = surface;
+    //const pointer_data: *PointerData = @ptrCast(@alignCast(c.wl_pointer_get_user_data(wl_pointer).?));
+    //pointer_data.*.target_surface = surface;
 
-    c.wl_surface_attach(pointer_data.*.surface, pointer_data.*.buffer, 0, 0);
-    c.wl_surface_commit(pointer_data.*.surface);
-    c.wl_pointer_set_cursor(wl_pointer, serial, pointer_data.*.surface, pointer_data.*.hot_spot_x, pointer_data.*.hot_spot_y);
+    //c.wl_surface_attach(pointer_data.*.surface, pointer_data.*.buffer, 0, 0);
+    //c.wl_surface_commit(pointer_data.*.surface);
+    //c.wl_pointer_set_cursor(wl_pointer, serial, pointer_data.*.surface, pointer_data.*.hot_spot_x, pointer_data.*.hot_spot_y);
 }
 
 fn pointerLeave(data: ?*anyopaque, wl_pointer: ?*c.wl_pointer, serial: u32, wl_surface: ?*c.wl_surface) callconv(.c) void {
@@ -281,7 +284,6 @@ const pointer_listener = c.wl_pointer_listener{ .enter = pointerEnter, .leave = 
 fn registryGlobal(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, c_interface: [*c]const u8, version: u32) callconv(.c) void {
     _ = data;
 
-    std.debug.print("called registry global - {s}\n", .{c_interface});
     const interface = std.mem.span(c_interface);
 
     if (std.mem.eql(u8, interface, std.mem.span(c.wl_compositor_interface.name))) {
@@ -345,7 +347,8 @@ const xdg_surface_listener = c.xdg_surface_listener{
 
 fn paint(pixels: []u8) void {
     const casted_pixels: []u32 = @alignCast(@ptrCast(pixels));
-    for (0..(width * height)) |i| {
-        casted_pixels[i] = 0xff0000ff;
+
+    for (0..casted_pixels.len) |i| {
+        casted_pixels[i] = 0xffff0000;
     }
 }
