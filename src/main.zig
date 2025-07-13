@@ -1,9 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("wayland-client.h");
-    @cInclude("wayland-client-protocol.h");
-    @cInclude("xdg-shell-client-protocol.h");
-});
+const c = @import("c.zig");
 
 //TODO check usage of anyopaque
 //TODO struct for hot_spot
@@ -90,11 +86,7 @@ fn cleanupWayland() void {
 }
 
 fn getDisplay() WaylandError!*c.wl_display {
-    if (c.wl_display_connect(null)) |d| {
-        return d;
-    }
-
-    return WaylandError.CouldNotConnectDisplay;
+    return c.wl_display_connect(null) orelse WaylandError.CouldNotConnectDisplay;
 }
 
 fn onButton(button: u32) void {
@@ -122,12 +114,11 @@ fn createMemoryPool(allocator: std.mem.Allocator, file_handle: std.fs.File.Handl
     errdefer std.posix.munmap(data.*.memory);
     paint(data.*.memory);
 
-    if (c.wl_shm_create_pool(shm, data.*.fd, @as(i32, @intCast(data.*.capacity)))) |pool| {
-        c.wl_shm_pool_set_user_data(pool, data);
-        return pool;
-    } else {
-        return WaylandError.CouldNotCreatePool;
-    }
+    const pool = c.wl_shm_create_pool(shm, data.*.fd, @as(i32, @intCast(data.*.capacity)))
+        orelse return WaylandError.CouldNotCreatePool;
+
+    c.wl_shm_pool_set_user_data(pool, data);
+    return pool;
 }
 
 fn freeMemoryPool(allocator: std.mem.Allocator, pool: *c.wl_shm_pool) void {
@@ -145,12 +136,11 @@ fn createBuffer(pool: *c.wl_shm_pool) WaylandError!*c.wl_buffer {
         return WaylandError.CouldNotCreatePoolBuffer; //TODO vlastni error
     }
 
-    if (c.wl_shm_pool_create_buffer(pool, @intCast(pool_data.*.size), width, height, width * pixel_size, pixel_format_id)) |b| {
-        pool_data.*.size += width * height * pixel_size;
-        return b;
-    } else {
-        return WaylandError.CouldNotCreatePoolBuffer;
-    }
+    const buffer = c.wl_shm_pool_create_buffer(pool, @intCast(pool_data.*.size), width, height, width * pixel_size, pixel_format_id)
+        orelse return WaylandError.CouldNotCreatePoolBuffer;
+
+    pool_data.*.size += width * height * pixel_size;
+    return buffer;
 }
 
 fn freeBuffer(buffer: *c.wl_buffer) void {
@@ -158,20 +148,11 @@ fn freeBuffer(buffer: *c.wl_buffer) void {
 }
 
 fn createSurface() !*c.xdg_surface {
-    var surface: *c.wl_surface = undefined;
-    var xdg_surface: *c.xdg_surface = undefined;
+    const surface = c.wl_compositor_create_surface(compositor)
+        orelse return WaylandError.CouldNotCreateSurface;
 
-    if (c.wl_compositor_create_surface(compositor)) |s| {
-        surface = s;
-    } else {
-        return WaylandError.CouldNotCreateSurface;
-    }
-
-    if (c.xdg_wm_base_get_xdg_surface(xdg_wm_base, surface)) |shell_s| {
-        xdg_surface = shell_s;
-    } else {
-        return WaylandError.CouldNotCreateShell; //TODO rename error
-    }
+    const xdg_surface: *c.xdg_surface = c.xdg_wm_base_get_xdg_surface(xdg_wm_base, surface)
+        orelse return WaylandError.CouldNotCreateShell; //TODO rename error
 
     //_ = c.wl_shell_surface_add_listener(shell_surface, &shell_surface_listener, null);
     _ = c.xdg_surface_add_listener(xdg_surface, &xdg_surface_listener, null);
@@ -209,12 +190,9 @@ fn setCursorFromPool(allocator: std.mem.Allocator, pool: *c.wl_shm_pool, hot_spo
     data.*.hot_spot_x = hot_spot_x;
     data.*.hot_spot_y = hot_spot_y;
 
-    if (c.wl_compositor_create_surface(compositor)) |surface| {
-        data.*.surface = surface;
-        errdefer c.wl_surface_destroy(data.*.surface);
-    } else {
-        return WaylandError.CompositorCouldNotCreateSurface;
-    }
+    data.*.surface = c.wl_compositor_create_surface(compositor)
+        orelse return WaylandError.CompositorCouldNotCreateSurface;
+    errdefer c.wl_surface_destroy(data.*.surface);
 
     data.*.buffer = try createBuffer(pool);
     c.wl_pointer_set_user_data(pointer, data);
@@ -312,12 +290,10 @@ const registry_listener = c.wl_registry_listener{
 
 fn createFile(allocator: std.mem.Allocator, size: usize) !std.fs.File {
     const template = "/simple-shm-1";
-    const dir = std.posix.getenv("XDG_RUNTIME_DIR");
-    if (dir == null) {
-        return WaylandError.XdgRuntimeDirNotSet;
-    }
+    const dir = std.posix.getenv("XDG_RUNTIME_DIR")
+        orelse return WaylandError.XdgRuntimeDirNotSet;
 
-    const paths = [_][]const u8{ dir.?, template };
+    const paths = [_][]const u8{ dir, template };
     const file_path = try std.fs.path.join(allocator, &paths);
     defer allocator.free(file_path);
 
