@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("c.zig");
+const c = @import("c.zig").c;
 
 //TODO check usage of anyopaque
 //TODO struct for hot_spot
@@ -30,7 +30,7 @@ const WaylandError = error{
     CouldNotCreateSurface,
     CouldNotCreateShell,
     CompositorCouldNotCreateSurface,
-    XdgRuntimeDirNotSet
+    XdgRuntimeDirNotSet,
 };
 
 pub fn main() !void {
@@ -182,7 +182,13 @@ fn setButtonCallback(xdg_surface: *c.xdg_surface, callback: *const fn (button: u
     c.wl_surface_set_user_data(surface, @constCast(callback));
 }
 
-const PointerData = struct { surface: *c.wl_surface, buffer: *c.wl_buffer, hot_spot_x: i32, hot_spot_y: i32, target_surface: ?*c.wl_surface };
+const PointerData = struct {
+    surface: *c.wl_surface,
+    buffer: *c.wl_buffer,
+    hot_spot_x: i32,
+    hot_spot_y: i32,
+    target_surface: ?*c.wl_surface,
+};
 
 fn setCursorFromPool(allocator: std.mem.Allocator, pool: *c.wl_shm_pool, hot_spot_x: i32, hot_spot_y: i32) !void {
     const data = try allocator.create(PointerData);

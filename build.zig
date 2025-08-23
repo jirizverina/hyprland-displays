@@ -6,11 +6,12 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "hyprland-displays",
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
-
 
     exe.linkLibC();
     exe.linkSystemLibrary("wayland-client");
@@ -46,30 +47,40 @@ pub fn build(b: *std.Build) void {
 fn generateAndLinkXdgFiles(b: *std.Build, exe: *std.Build.Step.Compile) void {
     const out_dir = "zig-out/wayland-generated";
     const xdg_xml = "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml";
-    const h_out = b.pathJoin(&.{out_dir, "xdg-shell-client-protocol.h" });
-    const c_out = b.pathJoin(&.{out_dir, "xdg-shell-protocol.c" });
+    const h_out = b.pathJoin(&.{ out_dir, "xdg-shell-client-protocol.h" });
+    const c_out = b.pathJoin(&.{ out_dir, "xdg-shell-protocol.c" });
 
-    const mk_gen_dir = b.addSystemCommand(&.{"mkdir", "-p", out_dir});
+    const mk_gen_dir = b.addSystemCommand(&.{
+        "mkdir",
+        "-p",
+        out_dir,
+    });
 
-    const gen_header = b.addSystemCommand(&.{"wayland-scanner", "client-header", xdg_xml, h_out});
+    const gen_header = b.addSystemCommand(&.{
+        "wayland-scanner",
+        "client-header",
+        xdg_xml,
+        h_out,
+    });
     gen_header.step.dependOn(&mk_gen_dir.step);
     exe.step.dependOn(&gen_header.step);
 
-    const gen_code = b.addSystemCommand(&.{"wayland-scanner", "private-code", xdg_xml, c_out});
+    const gen_code = b.addSystemCommand(&.{
+        "wayland-scanner",
+        "private-code",
+        xdg_xml,
+        c_out,
+    });
     gen_code.step.dependOn(&mk_gen_dir.step);
     exe.step.dependOn(&gen_code.step);
 
-
     exe.addIncludePath(.{ .src_path = .{
         .sub_path = out_dir,
-        .owner = b
-    }});
+        .owner = b,
+    } });
 
     exe.addCSourceFile(.{
-        .file = .{ .src_path = .{
-            .sub_path = c_out,
-            .owner = b
-        }},
-        .flags = &[_][]const u8{}
+        .file = .{ .src_path = .{ .sub_path = c_out, .owner = b } },
+        .flags = &[_][]const u8{},
     });
 }
