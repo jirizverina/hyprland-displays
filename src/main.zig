@@ -274,8 +274,9 @@ fn registryGlobal(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, c_int
         compositor = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_compositor_interface, @min(version, 4)).?);
     } else if (std.mem.eql(u8, interface, std.mem.span(c.wl_shm_interface.name))) {
         shm = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_shm_interface, @min(version, 1)).?);
-    } else if (std.mem.eql(u8, interface, std.mem.span(c.xdg_wm_base_interface.name))) { //TODO replace with xdg_vm_base
+    } else if (std.mem.eql(u8, interface, std.mem.span(c.xdg_wm_base_interface.name))) {
         xdg_wm_base = @ptrCast(c.wl_registry_bind(registry, name, &c.xdg_wm_base_interface, @min(version, 1)).?);
+        _ = c.xdg_wm_base_add_listener(xdg_wm_base, &xdg_wm_base_listener, null);
     } else if (std.mem.eql(u8, interface, std.mem.span(c.wl_seat_interface.name))) {
         seat = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_seat_interface, @min(version, 2)).?);
         pointer = c.wl_seat_get_pointer(seat).?;
@@ -325,6 +326,16 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, edges: u
 const xdg_surface_listener = c.xdg_surface_listener{
     //.ping = shellSurfacePing,
     .configure = xdgSurfaceConfigure,
+};
+
+fn handlePing(data: ?*anyopaque, wm_base: ?*c.xdg_wm_base, serial: u32) callconv(.c) void {
+    _ = data;
+
+    c.xdg_wm_base_pong(wm_base, serial);
+}
+
+const xdg_wm_base_listener = c.xdg_wm_base_listener{
+    .ping = handlePing,
 };
 
 fn paint(pixels: []u8) void {
