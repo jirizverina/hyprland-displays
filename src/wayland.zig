@@ -152,12 +152,12 @@ fn drawBuffer(allocator: std.mem.Allocator, width: u32, height: u32) !*c.wl_buff
 
     const pixels: []u32 = @ptrCast(@alignCast(data));
     for (pixels) |*pixel| {
-        pixel.* = 0xffff0000;
+        pixel.* = 0x00ff0000;
     }
 
     //TODO null handling
     const pool = c.wl_shm_create_pool(shm, fd, @intCast(size)).?;
-    const buffer = c.wl_shm_pool_create_buffer(pool, 0, @intCast(width), @intCast(height), @intCast(stride), c.WL_SHM_FORMAT_XRGB8888).?;
+    const buffer = c.wl_shm_pool_create_buffer(pool, 0, @intCast(width), @intCast(height), @intCast(stride), c.WL_SHM_FORMAT_ARGB8888).?;
     c.wl_shm_pool_destroy(pool);
 
     return buffer;
