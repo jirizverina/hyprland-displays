@@ -7,6 +7,7 @@ const c = @import("c.zig").c;
 //TODO: remove unused fields
 pub const Components = struct {
     listeners: Listeners = undefined,
+    buffer_context: ?BufferContext,
     //NOTE: it should be solved differently, but I need to pass the allocator to create file path for buffer file
     allocator: std.mem.Allocator,
     display: *c.wl_display,
@@ -33,7 +34,14 @@ const Listeners = struct {
     xdg_toplevel_listener: c.xdg_toplevel_listener,
 };
 
-const SetupError = error {
+const BufferContext = struct {
+    buffer: []align(std.heap.page_size_min) u8,
+    shm_pool: *c.wl_shm_pool,
+    file_descriptor: std.fs.File.Handle,
+    size: u32,
+};
+
+const SetupError = error{
     CouldNotConnectDisplay,
     CouldNotGetDisplayRegistry,
     CouldNotCreateSurface,
@@ -46,31 +54,32 @@ pub fn setupWayland(allocator: std.mem.Allocator) (SetupError || std.mem.Allocat
 
     const registry = c.wl_display_get_registry(display) orelse return SetupError.CouldNotGetDisplayRegistry;
 
-    const components = try allocator.create(Components);
+    var components = try allocator.create(Components);
+    components.buffer_context = null;
     components.allocator = allocator;
     components.display = display;
     components.registry = registry;
 
     components.listeners = .{
-        .registry_listener = c.wl_registry_listener {
+        .registry_listener = c.wl_registry_listener{
             .global = registryHandler,
             .global_remove = registryRemover,
         },
-        .xdg_surface_listener = c.xdg_surface_listener {
+        .xdg_surface_listener = c.xdg_surface_listener{
             .configure = xdgSurfaceConfigure,
         },
-        .xdg_toplevel_listener = c.xdg_toplevel_listener {
+        .xdg_toplevel_listener = c.xdg_toplevel_listener{
             .configure = xdgTopLevelConfigure,
             .close = xdgTopLevelClose,
         },
-        .xdg_wm_base_listener = c.xdg_wm_base_listener {
+        .xdg_wm_base_listener = c.xdg_wm_base_listener{
             .ping = xdgWmBasePing,
         },
-        .pointer_listener = c.wl_pointer_listener {
+        .pointer_listener = c.wl_pointer_listener{
             .enter = pointerEnter,
             .leave = pointerLeave,
             .motion = pointerMotion,
-            .button = pointerButton, 
+            .button = pointerButton,
             .axis = pointerAxis,
             .frame = pointerFrame,
             .axis_source = pointerAxisSource,
@@ -79,7 +88,7 @@ pub fn setupWayland(allocator: std.mem.Allocator) (SetupError || std.mem.Allocat
             .axis_value120 = pointerAxisValue120,
             .axis_relative_direction = pointerAxisRelativeDirection,
         },
-        .keyboard_listener = c.wl_keyboard_listener {
+        .keyboard_listener = c.wl_keyboard_listener{
             .keymap = keyboardKeymap,
             .enter = keyboardEnter,
             .leave = keyboardLeave,
@@ -171,7 +180,7 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, serial: 
 
     const components: *Components = @ptrCast(@alignCast(data.?));
 
-    const buffer = drawBuffer(components.allocator, components.shm, components.win_width, components.win_height) catch @panic("buffer wasn't created");
+    const buffer = createBuffer(components.allocator, &components.buffer_context, components.shm, components.win_width, components.win_height) catch @panic("buffer wasn't created");
     c.wl_surface_attach(components.surface, buffer, 0, 0);
 
     c.wl_surface_set_input_region(components.surface, null);
@@ -182,7 +191,6 @@ fn xdgTopLevelConfigure(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, width
     _ = xdg_toplevel;
     _ = states;
 
-     
     const compontents: *Components = @ptrCast(@alignCast(data.?));
     std.debug.assert(height > 0);
     std.debug.assert(width > 0);
@@ -198,45 +206,71 @@ fn xdgTopLevelClose(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel) callconv(
     std.c.exit(0); //TODO better exit handling
 }
 
-//TODO better error handling
-//NOTE: Called multiple times.
-// I am not sure that creating multiple files is optimal. There is an advantage in file size.
-//NOTE: I do not know if closing and deleting the file is valid solution.
-fn drawBuffer(allocator: std.mem.Allocator, shm: *c.wl_shm, width: u32, height: u32) !*c.wl_buffer {
-    std.log.debug("called drawBuffer\n", .{});
+fn createBuffer(allocator: std.mem.Allocator, buffer_context: *?BufferContext, shm: *c.wl_shm, width: u32, height: u32) !*c.wl_buffer {
+    std.log.debug("called createBuffer\n", .{});
     const stride = width * 4;
     const size = stride * height;
 
-    const file = try createShmFile(allocator, size);
-    defer file.close();
-    const fd = file.handle;
+    if (buffer_context.*) |*bc| {
+        if (size < bc.buffer.len) {
+            std.log.debug("shrinking buffer\n", .{});
+            bc.buffer = try std.posix.mremap(@alignCast(bc.buffer.ptr), bc.buffer.len, size, std.posix.MREMAP{}, null);
+            std.log.debug("shrinked buffer\n", .{});
+        } else if (size > bc.buffer.len) {
+            std.log.debug("growing buffer\n", .{});
+            if(size > bc.size) {
+                try std.posix.ftruncate(bc.file_descriptor, size);
+                c.wl_shm_pool_resize(bc.shm_pool, @intCast(size));
+                bc.size = size;
+            }
 
-    const data = try std.posix.mmap(null, size, PROT.READ | PROT.WRITE, std.posix.MAP{ .TYPE = .SHARED }, fd, 0);
-    defer std.posix.munmap(data);
+            bc.buffer = try std.posix.mremap(@alignCast(bc.buffer.ptr), bc.buffer.len, size, std.posix.MREMAP{ .MAYMOVE = true }, null);
 
-    const pixels: []u32 = @ptrCast(@alignCast(data));
+            std.log.debug("grown buffer\n", .{});
+        }
+    } else {
+        buffer_context.* = try setupBufferContext(allocator, shm, size);
+    }
+
+    const pixels: []u32 = @ptrCast(@alignCast(buffer_context.*.?.buffer));
 
     for (pixels) |*pixel| {
         pixel.* = 0xffff0000;
     }
     //x + y * width = i
-    const rc_x = 30;
-    const rc_y = 100;
-    const rc_w = 20;
-    const rc_h = 20;
+    const rc_x = 500;
+    const rc_y = 500;
+    const rc_w = 500;
+    const rc_h = 50;
 
-    for(rc_y..(rc_y + rc_h)) |y| {
-        for(rc_x..(rc_x + rc_w)) |x| {
-            pixels[x + y * width] = 0x000000ff;
+    const clamped_y = clamp(usize, rc_y, 0, height);
+    const clamped_x = clamp(usize, rc_x, 0, width);
+    for (clamped_y..clamp(usize, rc_y + rc_h, clamped_y, height)) |y| {
+        for (clamped_x..clamp(usize, rc_x + rc_w, clamped_x, width)) |x| {
+            pixels[x + y * width] = 0xff0000ff;
         }
     }
 
-
-    const pool = c.wl_shm_create_pool(shm, fd, @intCast(size)).?; //TODO null handling
-    const buffer = c.wl_shm_pool_create_buffer(pool, 0, @intCast(width), @intCast(height), @intCast(stride), c.WL_SHM_FORMAT_ARGB8888).?;
-    c.wl_shm_pool_destroy(pool);
-
+    const buffer = c.wl_shm_pool_create_buffer(buffer_context.*.?.shm_pool, 0, @intCast(width), @intCast(height), @intCast(stride), c.WL_SHM_FORMAT_ARGB8888).?; //TODO null handling
     return buffer;
+}
+
+fn clamp(T: type, value: T, min: T, max: T) T {
+    return @max(min, @min(value, max));
+}
+
+fn setupBufferContext(allocator: std.mem.Allocator, shm: *c.wl_shm, size: u32) !BufferContext {
+    std.log.debug("setupBufferContext\n", .{});
+
+    const file = try createShmFile(allocator, size); //TODO inline
+    const fd = file.handle;
+
+    return .{
+        .file_descriptor = fd,
+        .buffer = try std.posix.mmap(null, size, PROT.READ | PROT.WRITE, std.posix.MAP{ .TYPE = .SHARED, }, fd, 0), //TODO compare with std.os.linux.mmap
+        .shm_pool = c.wl_shm_create_pool(shm, fd, @intCast(size)).?, //TODO null handling
+        .size = size,
+    };
 }
 
 fn createShmFile(allocator: std.mem.Allocator, size: u32) !std.fs.File {
@@ -247,7 +281,7 @@ fn createShmFile(allocator: std.mem.Allocator, size: u32) !std.fs.File {
     const file_path = try std.fs.path.join(allocator, &paths);
     defer allocator.free(file_path);
 
-    const file = try std.fs.createFileAbsolute(file_path, std.fs.File.CreateFlags{ .read = true, .truncate = false, .exclusive = true });
+    const file = try std.fs.createFileAbsolute(file_path, std.fs.File.CreateFlags{ .read = true, .truncate = true, .exclusive = true, });
 
     try std.fs.deleteFileAbsolute(file_path); //deletes after file closes
     try file.setEndPos(size);
@@ -287,9 +321,9 @@ fn pointerMotion(data: ?*anyopaque, pointer: ?*c.wl_pointer, time: u32, surface_
 
 //TODO check std for values
 const LinuxInputEvent = enum(u32) {
-    btn_left       = 0x110,
-    btn_right      = 0x111,
-    btn_middle     = 0x112,
+    btn_left = 0x110,
+    btn_right = 0x111,
+    btn_middle = 0x112,
 };
 
 //TODO replace by values from C
@@ -297,7 +331,6 @@ const WlPointerButtonState = enum(u32) {
     released = 0,
     pressed = 1,
 };
-
 
 fn pointerButton(data: ?*anyopaque, pointer: ?*c.wl_pointer, serial: u32, time: u32, pointer_button: u32, pointer_state: u32) callconv(.c) void {
     _ = data;
@@ -335,14 +368,14 @@ fn pointerButton(data: ?*anyopaque, pointer: ?*c.wl_pointer, serial: u32, time: 
                     std.log.debug("Middle mouse button released", .{});
                 },
             }
-        }
+        },
     }
 }
 
 //TODO replace by values from C
 const PointerAxis = enum(u32) {
-     vertical_scroll = 0,
-     horizontal_scroll = 1, 
+    vertical_scroll = 0,
+    horizontal_scroll = 1,
 };
 
 fn pointerAxis(data: ?*anyopaque, pointer: ?*c.wl_pointer, time: u32, pointer_axis: u32, value: c.wl_fixed_t) callconv(.c) void {
@@ -364,13 +397,12 @@ fn pointerFrame(data: ?*anyopaque, pointer: ?*c.wl_pointer) callconv(.c) void {
     //TODO handle
 }
 
-
 //TODO replace by values from C
 const PointerAxisSource = enum(u32) {
-    wheel =         0,   //a physical wheel rotation
-    finger =        1,   //finger on a touch surface
-    continuous =    2,   //continuous coordinate space
-    wheel_tilt =    3,   //a physical wheel tilt
+    wheel = 0, //a physical wheel rotation
+    finger = 1, //finger on a touch surface
+    continuous = 2, //continuous coordinate space
+    wheel_tilt = 3, //a physical wheel tilt
 };
 
 fn pointerAxisSource(data: ?*anyopaque, pointer: ?*c.wl_pointer, pointer_axis_source: u32) callconv(.c) void {
@@ -462,7 +494,7 @@ fn keyboardLeave(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, surf
 const KeyboardKeyState = enum(u32) {
     released = 0,
     pressed = 1,
-    repeated = 2, 
+    repeated = 2,
 };
 
 fn keyboardKey(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, time: u32, key: u32, keyboard_key_state: c.enum_wl_keyboard_key_state) callconv(.c) void {
@@ -474,9 +506,9 @@ fn keyboardKey(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, time: 
     const key_state: KeyboardKeyState = @enumFromInt(keyboard_key_state);
 
     switch (key_state) {
-        .released => std.log.debug("Released key: {d}\n", .{ key }),
-        .pressed => std.log.debug("Pressed key: {d}\n", .{ key }),
-        .repeated => std.log.debug("Repeated key: {d}\n", .{ key }), 
+        .released => std.log.debug("Released key: {d}\n", .{key}),
+        .pressed => std.log.debug("Pressed key: {d}\n", .{key}),
+        .repeated => std.log.debug("Repeated key: {d}\n", .{key}),
     }
     //TODO handle
 }
