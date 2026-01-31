@@ -4,25 +4,29 @@ const std = @import("std");
 const PROT = std.posix.PROT;
 const c = @import("c.zig").c;
 
+const xdg_wm_base_version = 7;
+const compositor_version = 6;
+const shm_version = 1;
+const seat_version = 9;
+
 //TODO: remove unused fields
-pub const Components = struct {
-    listeners: Listeners = undefined,
+pub const Context = struct {
+    listeners: Listeners,
     buffer_context: ?BufferContext,
-    //NOTE: it should be solved differently, but I need to pass the allocator to create file path for buffer file
     allocator: std.mem.Allocator,
     display: *c.wl_display,
     registry: *c.wl_registry,
-    shm: *c.wl_shm = undefined,
-    compositor: *c.wl_compositor = undefined,
-    xdg_wm_base: *c.xdg_wm_base = undefined,
-    surface: *c.wl_surface = undefined,
-    seat: *c.wl_seat = undefined,
-    pointer: *c.wl_pointer = undefined,
-    keyboard: *c.wl_keyboard = undefined,
-    xdg_surface: *c.xdg_surface = undefined,
-    xdg_toplevel: *c.xdg_toplevel = undefined,
-    win_width: u32 = undefined,
-    win_height: u32 = undefined,
+    shm: *c.wl_shm,
+    compositor: *c.wl_compositor,
+    xdg_wm_base: *c.xdg_wm_base,
+    surface: *c.wl_surface,
+    seat: *c.wl_seat,
+    pointer: *c.wl_pointer,
+    keyboard: *c.wl_keyboard,
+    xdg_surface: *c.xdg_surface,
+    xdg_toplevel: *c.xdg_toplevel,
+    win_width: u32,
+    win_height: u32,
 };
 
 const Listeners = struct {
@@ -49,18 +53,14 @@ const SetupError = error{
     CouldNotGetXdgTopLevel,
 };
 
-pub fn setupWayland(allocator: std.mem.Allocator) (SetupError || std.mem.Allocator.Error)!*Components {
-    const display = c.wl_display_connect(null) orelse return SetupError.CouldNotConnectDisplay;
+pub fn setup(allocator: std.mem.Allocator) (SetupError || std.mem.Allocator.Error)!*Context {
+    var context = try allocator.create(Context);
+    context.buffer_context = null;
+    context.allocator = allocator;
+    context.display = c.wl_display_connect(null) orelse return SetupError.CouldNotConnectDisplay;
+    context.registry = c.wl_display_get_registry(context.display) orelse return SetupError.CouldNotGetDisplayRegistry;
 
-    const registry = c.wl_display_get_registry(display) orelse return SetupError.CouldNotGetDisplayRegistry;
-
-    var components = try allocator.create(Components);
-    components.buffer_context = null;
-    components.allocator = allocator;
-    components.display = display;
-    components.registry = registry;
-
-    components.listeners = .{
+    context.listeners = .{
         .registry_listener = c.wl_registry_listener{
             .global = registryHandler,
             .global_remove = registryRemover,
@@ -71,6 +71,8 @@ pub fn setupWayland(allocator: std.mem.Allocator) (SetupError || std.mem.Allocat
         .xdg_toplevel_listener = c.xdg_toplevel_listener{
             .configure = xdgTopLevelConfigure,
             .close = xdgTopLevelClose,
+            .configure_bounds = xdgTopLevelConfigureBounds,
+            .wm_capabilities = xdgTopLevelCapabilities,
         },
         .xdg_wm_base_listener = c.xdg_wm_base_listener{
             .ping = xdgWmBasePing,
@@ -98,41 +100,41 @@ pub fn setupWayland(allocator: std.mem.Allocator) (SetupError || std.mem.Allocat
         },
     };
 
-    _ = c.wl_registry_add_listener(registry, &components.listeners.registry_listener, components);
-    _ = c.wl_display_roundtrip(display);
+    _ = c.wl_registry_add_listener(context.registry, &context.listeners.registry_listener, context);
+    _ = c.wl_display_roundtrip(context.display);
 
     //TODO check compositor and xdg_wm_base
 
-    components.surface = c.wl_compositor_create_surface(components.compositor) orelse return SetupError.CouldNotCreateSurface;
-    components.xdg_surface = c.xdg_wm_base_get_xdg_surface(components.xdg_wm_base, components.surface) orelse return SetupError.CouldNotGetXdgSurface;
-    components.xdg_toplevel = c.xdg_surface_get_toplevel(components.xdg_surface) orelse return SetupError.CouldNotGetXdgTopLevel;
+    context.surface = c.wl_compositor_create_surface(context.compositor) orelse return SetupError.CouldNotCreateSurface;
+    context.xdg_surface = c.xdg_wm_base_get_xdg_surface(context.xdg_wm_base, context.surface) orelse return SetupError.CouldNotGetXdgSurface;
+    context.xdg_toplevel = c.xdg_surface_get_toplevel(context.xdg_surface) orelse return SetupError.CouldNotGetXdgTopLevel;
 
-    _ = c.xdg_surface_add_listener(components.xdg_surface, &components.listeners.xdg_surface_listener, components);
-    _ = c.xdg_toplevel_add_listener(components.xdg_toplevel, &components.listeners.xdg_toplevel_listener, components);
+    _ = c.xdg_surface_add_listener(context.xdg_surface, &context.listeners.xdg_surface_listener, context);
+    _ = c.xdg_toplevel_add_listener(context.xdg_toplevel, &context.listeners.xdg_toplevel_listener, context);
 
-    c.wl_surface_commit(components.surface);
+    c.wl_surface_commit(context.surface);
 
     //TODO create wayland log scope
-    std.log.debug("Wayland components created", .{});
-    return components;
+    std.log.debug("Wayland context created\n", .{});
+    return context;
 }
 
-pub fn cleanupWayland(allocator: std.mem.Allocator, components: *const Components) void {
-    c.xdg_toplevel_destroy(components.xdg_toplevel);
-    c.xdg_surface_destroy(components.xdg_surface);
-    c.wl_pointer_destroy(components.pointer);
-    c.wl_keyboard_destroy(components.keyboard);
-    c.wl_seat_destroy(components.seat);
-    c.wl_compositor_destroy(components.compositor);
-    c.wl_registry_destroy(components.registry);
-    c.wl_surface_destroy(components.surface);
-    c.xdg_wm_base_destroy(components.xdg_wm_base);
-    c.wl_display_disconnect(components.display);
+pub fn cleanup(allocator: std.mem.Allocator, context: *const Context) void {
+    c.xdg_toplevel_destroy(context.xdg_toplevel);
+    c.xdg_surface_destroy(context.xdg_surface);
+    c.wl_pointer_destroy(context.pointer);
+    c.wl_keyboard_destroy(context.keyboard);
+    c.wl_seat_destroy(context.seat);
+    c.wl_compositor_destroy(context.compositor);
+    c.wl_registry_destroy(context.registry);
+    c.wl_surface_destroy(context.surface);
+    c.xdg_wm_base_destroy(context.xdg_wm_base);
+    c.wl_display_disconnect(context.display);
 
-    allocator.destroy(components);
+    allocator.destroy(context);
 
     //TODO create wayland log scope
-    std.log.debug("Wayland components destroyed", .{});
+    std.log.debug("Wayland context destroyed\n", .{});
 }
 
 pub fn displayDispatch(display: *c.wl_display) bool {
@@ -142,25 +144,26 @@ pub fn displayDispatch(display: *c.wl_display) bool {
 fn registryHandler(data: ?*anyopaque, registry: ?*c.wl_registry, id: u32, c_interface: [*c]const u8, version: u32) callconv(.c) void {
     _ = version;
 
-    const components: *Components = @ptrCast(@alignCast(data.?));
+    const context: *Context = @ptrCast(@alignCast(data.?));
     const interface = std.mem.span(c_interface);
+
 
     //TODO null handling
     if (std.mem.eql(u8, interface, std.mem.span(c.wl_compositor_interface.name))) {
-        components.compositor = @ptrCast(c.wl_registry_bind(registry, id, &c.wl_compositor_interface, 4).?);
+        context.compositor = @ptrCast(c.wl_registry_bind(registry, id, &c.wl_compositor_interface, compositor_version).?);
     } else if (std.mem.eql(u8, interface, std.mem.span(c.xdg_wm_base_interface.name))) {
-        components.xdg_wm_base = @ptrCast(c.wl_registry_bind(registry, id, &c.xdg_wm_base_interface, 1).?);
-        _ = c.xdg_wm_base_add_listener(components.xdg_wm_base, &components.listeners.xdg_wm_base_listener, null);
+        context.xdg_wm_base = @ptrCast(c.wl_registry_bind(registry, id, &c.xdg_wm_base_interface, xdg_wm_base_version).?);
+        _ = c.xdg_wm_base_add_listener(context.xdg_wm_base, &context.listeners.xdg_wm_base_listener, null);
     } else if (std.mem.eql(u8, interface, std.mem.span(c.wl_shm_interface.name))) {
-        components.shm = @ptrCast(c.wl_registry_bind(registry, id, &c.wl_shm_interface, 1).?);
+        context.shm = @ptrCast(c.wl_registry_bind(registry, id, &c.wl_shm_interface, shm_version).?);
     } else if (std.mem.eql(u8, interface, std.mem.span(c.wl_seat_interface.name))) {
-        components.seat = @ptrCast(c.wl_registry_bind(registry, id, &c.wl_seat_interface, 9).?);
+        context.seat = @ptrCast(c.wl_registry_bind(registry, id, &c.wl_seat_interface, seat_version).?);
 
-        components.pointer = c.wl_seat_get_pointer(components.seat).?;
-        _ = c.wl_pointer_add_listener(components.pointer, &components.listeners.pointer_listener, null);
+        context.pointer = c.wl_seat_get_pointer(context.seat).?;
+        _ = c.wl_pointer_add_listener(context.pointer, &context.listeners.pointer_listener, null);
 
-        components.keyboard = c.wl_seat_get_keyboard(components.seat).?;
-        _ = c.wl_keyboard_add_listener(components.keyboard, &components.listeners.keyboard_listener, null);
+        context.keyboard = c.wl_seat_get_keyboard(context.seat).?;
+        _ = c.wl_keyboard_add_listener(context.keyboard, &context.listeners.keyboard_listener, null);
     }
 }
 
@@ -178,20 +181,24 @@ fn xdgWmBasePing(data: ?*anyopaque, wm_base: ?*c.xdg_wm_base, serial: u32) callc
 fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, serial: u32) callconv(.c) void {
     c.xdg_surface_ack_configure(xdg_surface, serial);
 
-    const components: *Components = @ptrCast(@alignCast(data.?));
+    const context: *Context = @ptrCast(@alignCast(data.?));
 
-    const buffer = createBuffer(components.allocator, &components.buffer_context, components.shm, components.win_width, components.win_height) catch @panic("buffer wasn't created");
-    c.wl_surface_attach(components.surface, buffer, 0, 0);
+    //NOTE might be better to call from xdgTopLevelConfigure
+    const buffer = createBuffer(context.allocator, &context.buffer_context, context.shm, context.win_width, context.win_height) catch @panic("buffer wasn't created");
+    c.wl_surface_attach(context.surface, buffer, 0, 0);
 
-    c.wl_surface_set_input_region(components.surface, null);
-    c.wl_surface_commit(components.surface);
+    c.wl_surface_set_input_region(context.surface, null);
+    c.wl_surface_commit(context.surface);
 }
 
-fn xdgTopLevelConfigure(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, width: i32, height: i32, states: [*c]c.wl_array) callconv(.c) void {
+fn xdgTopLevelConfigure(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, width: i32, height: i32, wl_states: [*c]c.wl_array) callconv(.c) void {
     _ = xdg_toplevel;
-    _ = states;
 
-    const compontents: *Components = @ptrCast(@alignCast(data.?));
+    const compontents: *Context = @ptrCast(@alignCast(data.?));
+    const states: []c_uint = std.mem.span(@as([*c]c_uint, @alignCast(@ptrCast(wl_states.*.data))));
+    //TODO handle states
+    _ = states;
+    
     std.debug.assert(height > 0);
     std.debug.assert(width > 0);
 
@@ -204,6 +211,19 @@ fn xdgTopLevelClose(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel) callconv(
     _ = xdg_toplevel;
 
     std.c.exit(0); //TODO better exit handling
+}
+
+fn xdgTopLevelConfigureBounds(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, width: i32, height: i32) callconv(.c) void {
+    _ = data; // autofix
+    _ = xdg_toplevel; // autofix
+    _ = width; // autofix
+    _ = height; // autofix
+}
+
+fn xdgTopLevelCapabilities(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, capabilities: [*c]c.wl_array) callconv(.c) void {
+    _ = data; // autofix
+    _ = xdg_toplevel; // autofix
+    _ = capabilities; // autofix
 }
 
 fn createBuffer(allocator: std.mem.Allocator, buffer_context: *?BufferContext, shm: *c.wl_shm, width: u32, height: u32) !*c.wl_buffer {
@@ -346,26 +366,26 @@ fn pointerButton(data: ?*anyopaque, pointer: ?*c.wl_pointer, serial: u32, time: 
         .pressed => {
             switch (button) {
                 .btn_left => {
-                    std.log.debug("Left mouse button pressed", .{});
+                    std.log.debug("Left mouse button pressed\n", .{});
                 },
                 .btn_right => {
-                    std.log.debug("Right mouse button pressed", .{});
+                    std.log.debug("Right mouse button pressed\n", .{});
                 },
                 .btn_middle => {
-                    std.log.debug("Middle mouse button pressed", .{});
+                    std.log.debug("Middle mouse button pressed\n", .{});
                 },
             }
         },
         .released => {
             switch (button) {
                 .btn_left => {
-                    std.log.debug("Left mouse button released", .{});
+                    std.log.debug("Left mouse button released\n", .{});
                 },
                 .btn_right => {
-                    std.log.debug("Right mouse button released", .{});
+                    std.log.debug("Right mouse button released\n", .{});
                 },
                 .btn_middle => {
-                    std.log.debug("Middle mouse button released", .{});
+                    std.log.debug("Middle mouse button released\n", .{});
                 },
             }
         },
@@ -393,7 +413,7 @@ fn pointerFrame(data: ?*anyopaque, pointer: ?*c.wl_pointer) callconv(.c) void {
     _ = data;
     _ = pointer;
 
-    std.log.debug("End of pointer frame", .{});
+    std.log.debug("End of pointer frame\n", .{});
     //TODO handle
 }
 
