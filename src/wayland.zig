@@ -25,8 +25,6 @@ pub const Context = struct {
     keyboard: *c.wl_keyboard,
     xdg_surface: *c.xdg_surface,
     xdg_toplevel: *c.xdg_toplevel,
-    win_width: u32,
-    win_height: u32,
 };
 
 const Listeners = struct {
@@ -39,10 +37,15 @@ const Listeners = struct {
 };
 
 const BufferContext = struct {
-    buffer: []align(std.heap.page_size_min) u8,
+    data: []align(std.heap.page_size_min) u8,
     shm_pool: *c.wl_shm_pool,
+    buffer: *c.wl_buffer,
     file_descriptor: std.fs.File.Handle,
-    size: u32,
+    file_size: u32,
+    window_width: u32,
+    window_height: u32,
+
+    const pixel_size = 4;
 };
 
 const SetupError = error{
@@ -114,8 +117,6 @@ pub fn setup(allocator: std.mem.Allocator) (SetupError || std.mem.Allocator.Erro
 
     c.wl_surface_commit(context.surface);
 
-    //TODO create wayland log scope
-    std.log.debug("Wayland context created\n", .{});
     return context;
 }
 
@@ -132,9 +133,6 @@ pub fn cleanup(allocator: std.mem.Allocator, context: *const Context) void {
     c.wl_display_disconnect(context.display);
 
     allocator.destroy(context);
-
-    //TODO create wayland log scope
-    std.log.debug("Wayland context destroyed\n", .{});
 }
 
 pub fn displayDispatch(display: *c.wl_display) bool {
@@ -182,10 +180,10 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, serial: 
     c.xdg_surface_ack_configure(xdg_surface, serial);
 
     const context: *Context = @ptrCast(@alignCast(data.?));
+    const buffer_context = context.buffer_context.?;
 
-    //NOTE might be better to call from xdgTopLevelConfigure
-    const buffer = createBuffer(context.allocator, &context.buffer_context, context.shm, context.win_width, context.win_height) catch @panic("buffer wasn't created");
-    c.wl_surface_attach(context.surface, buffer, 0, 0);
+    drawToBuffer(buffer_context.data, buffer_context.window_width, buffer_context.window_height);
+    c.wl_surface_attach(context.surface, buffer_context.buffer, 0, 0);
 
     c.wl_surface_set_input_region(context.surface, null);
     c.wl_surface_commit(context.surface);
@@ -194,7 +192,7 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, serial: 
 fn xdgTopLevelConfigure(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, width: i32, height: i32, wl_states: [*c]c.wl_array) callconv(.c) void {
     _ = xdg_toplevel;
 
-    const compontents: *Context = @ptrCast(@alignCast(data.?));
+    const context: *Context = @ptrCast(@alignCast(data.?));
     const states: []c_uint = std.mem.span(@as([*c]c_uint, @alignCast(@ptrCast(wl_states.*.data))));
     //TODO handle states
     _ = states;
@@ -202,8 +200,13 @@ fn xdgTopLevelConfigure(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, width
     std.debug.assert(height > 0);
     std.debug.assert(width > 0);
 
-    compontents.win_width = @intCast(width);
-    compontents.win_height = @intCast(height);
+    if (context.buffer_context) |*bc| {
+        resizeBuffer(bc, @intCast(width), @intCast(height))
+            catch |e| @panic(@errorName(e));
+    } else {
+        context.buffer_context = setupBufferContext(context.allocator, context.shm, @intCast(width), @intCast(height))
+            catch |e| @panic(@errorName(e));
+    }
 }
 
 fn xdgTopLevelClose(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel) callconv(.c) void {
@@ -226,33 +229,8 @@ fn xdgTopLevelCapabilities(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, ca
     _ = capabilities; // autofix
 }
 
-fn createBuffer(allocator: std.mem.Allocator, buffer_context: *?BufferContext, shm: *c.wl_shm, width: u32, height: u32) !*c.wl_buffer {
-    std.log.debug("called createBuffer\n", .{});
-    const stride = width * 4;
-    const size = stride * height;
-
-    if (buffer_context.*) |*bc| {
-        if (size < bc.buffer.len) {
-            std.log.debug("shrinking buffer\n", .{});
-            bc.buffer = try std.posix.mremap(@alignCast(bc.buffer.ptr), bc.buffer.len, size, std.posix.MREMAP{}, null);
-            std.log.debug("shrinked buffer\n", .{});
-        } else if (size > bc.buffer.len) {
-            std.log.debug("growing buffer\n", .{});
-            if(size > bc.size) {
-                try std.posix.ftruncate(bc.file_descriptor, size);
-                c.wl_shm_pool_resize(bc.shm_pool, @intCast(size));
-                bc.size = size;
-            }
-
-            bc.buffer = try std.posix.mremap(@alignCast(bc.buffer.ptr), bc.buffer.len, size, std.posix.MREMAP{ .MAYMOVE = true }, null);
-
-            std.log.debug("grown buffer\n", .{});
-        }
-    } else {
-        buffer_context.* = try setupBufferContext(allocator, shm, size);
-    }
-
-    const pixels: []u32 = @ptrCast(@alignCast(buffer_context.*.?.buffer));
+fn drawToBuffer(buffer: []u8, width: u32, height: u32) void {
+    const pixels: []u32 = @ptrCast(@alignCast(buffer));
 
     for (pixels) |*pixel| {
         pixel.* = 0xffff0000;
@@ -270,27 +248,51 @@ fn createBuffer(allocator: std.mem.Allocator, buffer_context: *?BufferContext, s
             pixels[x + y * width] = 0xff0000ff;
         }
     }
-
-    const buffer = c.wl_shm_pool_create_buffer(buffer_context.*.?.shm_pool, 0, @intCast(width), @intCast(height), @intCast(stride), c.WL_SHM_FORMAT_ARGB8888).?; //TODO null handling
-    return buffer;
 }
 
 fn clamp(T: type, value: T, min: T, max: T) T {
     return @max(min, @min(value, max));
 }
 
-fn setupBufferContext(allocator: std.mem.Allocator, shm: *c.wl_shm, size: u32) !BufferContext {
-    std.log.debug("setupBufferContext\n", .{});
+fn setupBufferContext(allocator: std.mem.Allocator, shm: *c.wl_shm, width: u32, height: u32) !BufferContext {
+    const stride = width * BufferContext.pixel_size;
+    const size = height * stride;
 
     const file = try createShmFile(allocator, size); //TODO inline
     const fd = file.handle;
+    const shm_pool = c.wl_shm_create_pool(shm, fd, @intCast(size)).?;
+    const buffer = c.wl_shm_pool_create_buffer(shm_pool, 0, @intCast(width), @intCast(height), @intCast(stride), c.WL_SHM_FORMAT_ARGB8888).?;
 
     return .{
         .file_descriptor = fd,
-        .buffer = try std.posix.mmap(null, size, PROT.READ | PROT.WRITE, std.posix.MAP{ .TYPE = .SHARED, }, fd, 0), //TODO compare with std.os.linux.mmap
-        .shm_pool = c.wl_shm_create_pool(shm, fd, @intCast(size)).?, //TODO null handling
-        .size = size,
+        .data = try std.posix.mmap(null, size, PROT.READ | PROT.WRITE, std.posix.MAP{ .TYPE = .SHARED, }, fd, 0), //TODO compare with std.os.linux.mmap
+        .shm_pool = shm_pool,
+        .buffer = buffer,
+        .file_size = size,
+        .window_width = width,
+        .window_height = height,
     };
+}
+
+fn resizeBuffer(bc: *BufferContext, width: u32, height: u32) !void {
+    const new_stride = width * BufferContext.pixel_size;
+    const new_size = height * new_stride;
+
+    if (new_size < bc.data.len) {
+        bc.data = try std.posix.mremap(@alignCast(bc.data.ptr), bc.data.len, new_size, std.posix.MREMAP{}, null);
+    } else if (new_size > bc.data.len) {
+        if(new_size > bc.file_size) {
+            try std.posix.ftruncate(bc.file_descriptor, new_size);
+            c.wl_shm_pool_resize(bc.shm_pool, @intCast(new_size));
+            bc.file_size = new_size;
+        }
+
+        bc.data = try std.posix.mremap(@alignCast(bc.data.ptr), bc.data.len, new_size, std.posix.MREMAP{ .MAYMOVE = true }, null);
+    }
+
+    bc.window_width = width;
+    bc.window_height = height;
+    bc.buffer = c.wl_shm_pool_create_buffer(bc.*.shm_pool, 0, @intCast(width), @intCast(height), @intCast(new_stride), c.WL_SHM_FORMAT_ARGB8888).?;
 }
 
 fn createShmFile(allocator: std.mem.Allocator, size: u32) !std.fs.File {
@@ -413,7 +415,6 @@ fn pointerFrame(data: ?*anyopaque, pointer: ?*c.wl_pointer) callconv(.c) void {
     _ = data;
     _ = pointer;
 
-    std.log.debug("End of pointer frame\n", .{});
     //TODO handle
 }
 
