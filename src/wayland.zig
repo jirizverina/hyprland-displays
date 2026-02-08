@@ -27,7 +27,7 @@ pub const Context = struct {
     xdg_toplevel: *c.xdg_toplevel,
 };
 
-const Listeners = struct {
+pub const Listeners = struct {
     pointer_listener: c.wl_pointer_listener,
     keyboard_listener: c.wl_keyboard_listener,
     registry_listener: c.wl_registry_listener,
@@ -36,7 +36,7 @@ const Listeners = struct {
     xdg_toplevel_listener: c.xdg_toplevel_listener,
 };
 
-const BufferContext = struct {
+pub const BufferContext = struct {
     data: []align(std.heap.page_size_min) u8,
     shm_pool: *c.wl_shm_pool,
     buffer: *c.wl_buffer,
@@ -48,7 +48,7 @@ const BufferContext = struct {
     const pixel_size = 4;
 };
 
-const SetupError = error{
+pub const SetupError = error{
     CouldNotConnectDisplay,
     CouldNotGetDisplayRegistry,
     CouldNotCreateSurface,
@@ -182,7 +182,7 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, serial: 
     const context: *Context = @ptrCast(@alignCast(data.?));
     const buffer_context = context.buffer_context.?;
 
-    drawToBuffer(buffer_context.data, buffer_context.window_width, buffer_context.window_height);
+    // drawToBuffer(buffer_context.data, buffer_context.window_width, buffer_context.window_height);
     c.wl_surface_attach(context.surface, buffer_context.buffer, 0, 0);
 
     c.wl_surface_set_input_region(context.surface, null);
@@ -227,31 +227,6 @@ fn xdgTopLevelCapabilities(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, ca
     _ = data; // autofix
     _ = xdg_toplevel; // autofix
     _ = capabilities; // autofix
-}
-
-fn drawToBuffer(buffer: []u8, width: u32, height: u32) void {
-    const pixels: []u32 = @ptrCast(@alignCast(buffer));
-
-    for (pixels) |*pixel| {
-        pixel.* = 0xffff0000;
-    }
-    //x + y * width = i
-    const rc_x = 500;
-    const rc_y = 500;
-    const rc_w = 500;
-    const rc_h = 50;
-
-    const clamped_y = clamp(usize, rc_y, 0, height);
-    const clamped_x = clamp(usize, rc_x, 0, width);
-    for (clamped_y..clamp(usize, rc_y + rc_h, clamped_y, height)) |y| {
-        for (clamped_x..clamp(usize, rc_x + rc_w, clamped_x, width)) |x| {
-            pixels[x + y * width] = 0xff0000ff;
-        }
-    }
-}
-
-fn clamp(T: type, value: T, min: T, max: T) T {
-    return @max(min, @min(value, max));
 }
 
 fn setupBufferContext(allocator: std.mem.Allocator, shm: *c.wl_shm, width: u32, height: u32) !BufferContext {
