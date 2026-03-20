@@ -10,101 +10,52 @@ pub const std_options: std.Options = .{
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
 
-    const wayland_context = try wayland.setup(allocator);
+    const wayland_context = try wayland.setup(allocator, drawUi);
     defer wayland.cleanup(allocator, wayland_context);
 
-    var rec_children: [2]ui.Element = undefined;
-    const rect = ui.Element{
-        .children = &rec_children,
-        .parent = null,
-        .x = 100,
-        .y = 200,
-        .width = 500,
-        .height = 500,
-        .color = .{
-            .a = 255,
-            .r = 0,
-            .g = 255,
-            .b = 0,
-        },
-    };
-
-    rec_children[0] = ui.Element{
-        .parent = &rect,
-        .x = 0,
-        .y = 0,
-        .width = 100,
-        .height = 50,
-        .color = .{
-            .a = 255,
-            .r = 255,
-            .g = 0,
-            .b = 127,
-        },
-    };
-
-    rec_children[1] = ui.Element{
-        .parent = &rect,
-        .x = 100,
-        .y = 0,
-        .width = 500,
-        .height = 200,
-        .color = .{
-            .a = 255,
-            .r = 0,
-            .g = 255,
-            .b = 255,
-        },
-    };
-
     while (wayland.displayDispatch(wayland_context.display)) {
-        const buffer_context = wayland_context.buffer_context.?;
-        clear(buffer_context.data);
-        drawElement(&buffer_context, &rect);
     }
 }
 
-fn drawElement(buffer_context: *const wayland.BufferContext, element: *const ui.Element) void {
-    const color: u32 = @bitCast(element.*.color);
+const AppState = struct { int: u32 = 0 };
 
-    var x = element.x;
-    var y = element.y;
-    //TODO has to be recursive
-    if(element.parent) |parent| {
-        x += parent.x;
-        y += parent.y;
+fn drawUi(ctx: *wayland.Context) !void {
+    const buffer_context = &ctx.buffer_context.?;
+
+    const offset = buffer_context.buffer_size * buffer_context.index;
+    const ui_ctx: ui.Context = .{
+        .buffer = buffer_context.file_data[offset..(buffer_context.buffer_size + offset)],
+        .win_height = buffer_context.heigth,
+        .win_width = buffer_context.width,
+    };
+
+    @memset(ui_ctx.buffer, 0);
+
+    //TODO 256 should be calculated in wayland
+    const pointer_pos: ui.Position = .{
+        .x = @intCast(@max(0, @divTrunc(ctx.pointer_position_x, 256))),
+        .y = @intCast(@max(0, @divTrunc(ctx.pointer_position_y, 256))),
+    };
+
+    const rect: *const ui.Rectangle = &.{
+        .position = .{ .x = 0, .y = 0 },
+        .height = 200,
+        .width = 400,
+    };
+
+    if (rect.contains(pointer_pos)) {
+        ui.drawRectangle(&ui_ctx, rect, .{ .r = 0x00, .g = 0xFF, .b = 0xFF });
+    } else {
+        ui.drawRectangle(&ui_ctx, rect, .{ .r = 0xFF, .g = 0x00, .b = 0xFF });
     }
 
-    drawRect(buffer_context.data, buffer_context.window_width, buffer_context.window_height, x, y, element.width, element.height, color);
+    const rect2: *const ui.Rectangle = &.{
+        .position = .{ .x = 500, .y = 500 },
+        .height = 50,
+        .width = 10,
+    };
 
-    if (element.children) |children| {
-        for (children) |*child| {
-            drawElement(buffer_context, child);
-        }
-    }
-}
+    ui.drawRectangle(&ui_ctx, rect2, .{ .r = 0x00, .g = 0xFF, .b = 0x00});
 
-fn drawRect(buffer: []u8, win_width: u32, win_height: u32, pos_x: u32, pos_y: u32, width: u32, height: u32, color: u32) void {
-    const pixels: []u32 = @ptrCast(@alignCast(buffer));
-
-    const start_y = clamp(u32, pos_y, 0, win_height);
-    const end_y = clamp(u32, start_y + height, start_y, win_height);
-    const start_x = clamp(u32, pos_x, 0, win_width);
-    const end_x = clamp(u32, start_x + width, start_y, win_width);
-
-    for (start_y..end_y) |y| {
-        for (start_x..end_x) |x| {
-            pixels[x + y * win_width] = color;
-        }
-    }
-}
-
-fn clear(buffer: []u8) void {
-    for (buffer) |*val| {
-        val.* = 0;
-    }
-}
-
-fn clamp(T: type, value: T, min: T, max: T) T {
-    return @max(min, @min(value, max));
+    try wayland.draw(ctx);
 }

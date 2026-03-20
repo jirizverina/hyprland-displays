@@ -9,10 +9,12 @@ const compositor_version = 6;
 const shm_version = 1;
 const seat_version = 9;
 
+const pitch = 4;
+
 //TODO: remove unused fields
 pub const Context = struct {
-    listeners: Listeners,
     buffer_context: ?BufferContext,
+    listeners: Listeners,
     allocator: std.mem.Allocator,
     display: *c.wl_display,
     registry: *c.wl_registry,
@@ -25,27 +27,29 @@ pub const Context = struct {
     keyboard: *c.wl_keyboard,
     xdg_surface: *c.xdg_surface,
     xdg_toplevel: *c.xdg_toplevel,
+    pointer_position_x: i32,
+    pointer_position_y: i32,
 };
 
 pub const Listeners = struct {
     pointer_listener: c.wl_pointer_listener,
     keyboard_listener: c.wl_keyboard_listener,
     registry_listener: c.wl_registry_listener,
+    buffer_listener: c.wl_buffer_listener,
     xdg_wm_base_listener: c.xdg_wm_base_listener,
     xdg_surface_listener: c.xdg_surface_listener,
     xdg_toplevel_listener: c.xdg_toplevel_listener,
 };
 
 pub const BufferContext = struct {
-    data: []align(std.heap.page_size_min) u8,
-    shm_pool: *c.wl_shm_pool,
-    buffer: *c.wl_buffer,
     file_descriptor: std.fs.File.Handle,
-    file_size: u32,
-    window_width: u32,
-    window_height: u32,
-
-    const pixel_size = 4;
+    file_data: []align(std.heap.page_size_min) u8,
+    shm_pool: *c.wl_shm_pool,
+    index: u8,
+    width: u32,
+    heigth: u32,
+    stride: u32,
+    buffer_size: u32,
 };
 
 pub const SetupError = error{
@@ -56,7 +60,11 @@ pub const SetupError = error{
     CouldNotGetXdgTopLevel,
 };
 
-pub fn setup(allocator: std.mem.Allocator) (SetupError || std.mem.Allocator.Error)!*Context {
+var drawUi: *const fn(context: *Context) anyerror!void = undefined;
+
+pub fn setup(allocator: std.mem.Allocator, draw_ui: *const fn(context: *Context) anyerror!void) (SetupError || std.mem.Allocator.Error)!*Context {
+    drawUi = draw_ui;
+
     var context = try allocator.create(Context);
     context.buffer_context = null;
     context.allocator = allocator;
@@ -101,6 +109,9 @@ pub fn setup(allocator: std.mem.Allocator) (SetupError || std.mem.Allocator.Erro
             .modifiers = keyboardModifiers,
             .repeat_info = keyboardRepeatInfo,
         },
+        .buffer_listener = c.wl_buffer_listener{
+            .release = bufferRelease,
+        },
     };
 
     _ = c.wl_registry_add_listener(context.registry, &context.listeners.registry_listener, context);
@@ -135,8 +146,13 @@ pub fn cleanup(allocator: std.mem.Allocator, context: *const Context) void {
     allocator.destroy(context);
 }
 
+var last_dispatch: i32 = -1;
 pub fn displayDispatch(display: *c.wl_display) bool {
-    return c.wl_display_dispatch(display) >= 0;
+    const dispatch_value = c.wl_display_dispatch(display);
+    if (last_dispatch != dispatch_value) {
+        last_dispatch = dispatch_value;
+    }
+    return dispatch_value >= 0;
 }
 
 fn registryHandler(data: ?*anyopaque, registry: ?*c.wl_registry, id: u32, c_interface: [*c]const u8, version: u32) callconv(.c) void {
@@ -144,7 +160,6 @@ fn registryHandler(data: ?*anyopaque, registry: ?*c.wl_registry, id: u32, c_inte
 
     const context: *Context = @ptrCast(@alignCast(data.?));
     const interface = std.mem.span(c_interface);
-
 
     //TODO null handling
     if (std.mem.eql(u8, interface, std.mem.span(c.wl_compositor_interface.name))) {
@@ -158,7 +173,7 @@ fn registryHandler(data: ?*anyopaque, registry: ?*c.wl_registry, id: u32, c_inte
         context.seat = @ptrCast(c.wl_registry_bind(registry, id, &c.wl_seat_interface, seat_version).?);
 
         context.pointer = c.wl_seat_get_pointer(context.seat).?;
-        _ = c.wl_pointer_add_listener(context.pointer, &context.listeners.pointer_listener, null);
+        _ = c.wl_pointer_add_listener(context.pointer, &context.listeners.pointer_listener, context);
 
         context.keyboard = c.wl_seat_get_keyboard(context.seat).?;
         _ = c.wl_keyboard_add_listener(context.keyboard, &context.listeners.keyboard_listener, null);
@@ -180,33 +195,33 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, serial: 
     c.xdg_surface_ack_configure(xdg_surface, serial);
 
     const context: *Context = @ptrCast(@alignCast(data.?));
-    const buffer_context = context.buffer_context.?;
+    _ = context;
 
-    // drawToBuffer(buffer_context.data, buffer_context.window_width, buffer_context.window_height);
-    c.wl_surface_attach(context.surface, buffer_context.buffer, 0, 0);
-
-    c.wl_surface_set_input_region(context.surface, null);
-    c.wl_surface_commit(context.surface);
+    // TODO drawUI(context)
 }
 
-fn xdgTopLevelConfigure(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, width: i32, height: i32, wl_states: [*c]c.wl_array) callconv(.c) void {
+fn xdgTopLevelConfigure(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, surface_width: i32, surface_height: i32, wl_states: [*c]c.wl_array) callconv(.c) void {
     _ = xdg_toplevel;
 
     const context: *Context = @ptrCast(@alignCast(data.?));
-    const states: []c_uint = std.mem.span(@as([*c]c_uint, @alignCast(@ptrCast(wl_states.*.data))));
+    const states: []c_uint = std.mem.span(@as([*c]c_uint, @ptrCast(@alignCast(wl_states.*.data))));
     //TODO handle states
     _ = states;
-    
-    std.debug.assert(height > 0);
-    std.debug.assert(width > 0);
+
+    std.debug.assert(surface_height >= 0);
+    std.debug.assert(surface_width >= 0);
+
+    const height = if (surface_height != 0) surface_height else 400;
+    const width = if (surface_width != 0) surface_width else 400;
 
     if (context.buffer_context) |*bc| {
-        resizeBuffer(bc, @intCast(width), @intCast(height))
-            catch |e| @panic(@errorName(e));
+        resizeBuffer(bc, @intCast(width), @intCast(height)) catch |e| @panic(@errorName(e));
     } else {
-        context.buffer_context = setupBufferContext(context.allocator, context.shm, @intCast(width), @intCast(height))
-            catch |e| @panic(@errorName(e));
+        setupBufferContext(context.allocator, context, @intCast(width), @intCast(height)) catch |e| @panic(@errorName(e));
     }
+
+    //TODO nejspis by se melo dit az v xdgSurfaceConfigure
+    drawUi(context) catch |e| @panic(@errorName(e));
 }
 
 fn xdgTopLevelClose(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel) callconv(.c) void {
@@ -229,45 +244,57 @@ fn xdgTopLevelCapabilities(data: ?*anyopaque, xdg_toplevel: ?*c.xdg_toplevel, ca
     _ = capabilities; // autofix
 }
 
-fn setupBufferContext(allocator: std.mem.Allocator, shm: *c.wl_shm, width: u32, height: u32) !BufferContext {
-    const stride = width * BufferContext.pixel_size;
-    const size = height * stride;
+fn bufferRelease(data: ?*anyopaque, buffer: ?*c.wl_buffer) callconv(.c) void {
+    _ = data;
+
+    c.wl_buffer_destroy(buffer);
+}
+
+fn setupBufferContext(allocator: std.mem.Allocator, context: *Context, width: u32, height: u32) !void {
+    const stride = width * pitch;
+    const buffer_size = height * stride;
+    const size = buffer_size * 2;
+    const index = 0;
 
     const file = try createShmFile(allocator, size); //TODO inline
     const fd = file.handle;
-    const shm_pool = c.wl_shm_create_pool(shm, fd, @intCast(size)).?;
-    const buffer = c.wl_shm_pool_create_buffer(shm_pool, 0, @intCast(width), @intCast(height), @intCast(stride), c.WL_SHM_FORMAT_ARGB8888).?;
+    const shm_pool = c.wl_shm_create_pool(context.shm, fd, @intCast(size)).?;
 
-    return .{
+    context.buffer_context = .{
         .file_descriptor = fd,
-        .data = try std.posix.mmap(null, size, PROT.READ | PROT.WRITE, std.posix.MAP{ .TYPE = .SHARED, }, fd, 0), //TODO compare with std.os.linux.mmap
         .shm_pool = shm_pool,
-        .buffer = buffer,
-        .file_size = size,
-        .window_width = width,
-        .window_height = height,
+        // zig fmt: off
+        .file_data = try std.posix.mmap(null,  //TODO compare with std.os.linux.mmap
+            size,
+            PROT.READ | PROT.WRITE,
+            std.posix.MAP{ .TYPE = .SHARED, },
+            fd, 0),
+            // zig fmt: on
+        .index = index,
+        .width = width,
+        .heigth = height,
+        .stride = stride,
+        .buffer_size = buffer_size,
     };
+
 }
 
-fn resizeBuffer(bc: *BufferContext, width: u32, height: u32) !void {
-    const new_stride = width * BufferContext.pixel_size;
-    const new_size = height * new_stride;
+fn resizeBuffer(buffer_context: *BufferContext, width: u32, height: u32) !void {
+    const new_stride = width * pitch;
+    const new_buffer_size = height * new_stride;
+    const new_size = new_buffer_size * 2;
 
-    if (new_size < bc.data.len) {
-        bc.data = try std.posix.mremap(@alignCast(bc.data.ptr), bc.data.len, new_size, std.posix.MREMAP{}, null);
-    } else if (new_size > bc.data.len) {
-        if(new_size > bc.file_size) {
-            try std.posix.ftruncate(bc.file_descriptor, new_size);
-            c.wl_shm_pool_resize(bc.shm_pool, @intCast(new_size));
-            bc.file_size = new_size;
-        }
+   if (new_size > buffer_context.file_data.len) {
+        try std.posix.ftruncate(buffer_context.file_descriptor, new_size);
+        c.wl_shm_pool_resize(buffer_context.shm_pool, @intCast(new_size));
 
-        bc.data = try std.posix.mremap(@alignCast(bc.data.ptr), bc.data.len, new_size, std.posix.MREMAP{ .MAYMOVE = true }, null);
+        buffer_context.file_data = try std.posix.mremap(@alignCast(buffer_context.file_data.ptr), buffer_context.file_data.len, new_size, std.posix.MREMAP{ .MAYMOVE = true }, null);
     }
 
-    bc.window_width = width;
-    bc.window_height = height;
-    bc.buffer = c.wl_shm_pool_create_buffer(bc.*.shm_pool, 0, @intCast(width), @intCast(height), @intCast(new_stride), c.WL_SHM_FORMAT_ARGB8888).?;
+    buffer_context.width = width;
+    buffer_context.heigth = height;
+    buffer_context.stride = new_stride;
+    buffer_context.buffer_size = new_buffer_size;
 }
 
 fn createShmFile(allocator: std.mem.Allocator, size: u32) !std.fs.File {
@@ -278,7 +305,11 @@ fn createShmFile(allocator: std.mem.Allocator, size: u32) !std.fs.File {
     const file_path = try std.fs.path.join(allocator, &paths);
     defer allocator.free(file_path);
 
-    const file = try std.fs.createFileAbsolute(file_path, std.fs.File.CreateFlags{ .read = true, .truncate = true, .exclusive = true, });
+    const file = try std.fs.createFileAbsolute(file_path, std.fs.File.CreateFlags{
+        .read = true,
+        .truncate = true,
+        .exclusive = true,
+    });
 
     try std.fs.deleteFileAbsolute(file_path); //deletes after file closes
     try file.setEndPos(size);
@@ -293,8 +324,6 @@ fn pointerEnter(data: ?*anyopaque, pointer: ?*c.wl_pointer, serial: u32, surface
     _ = surface;
     _ = surface_x;
     _ = surface_y;
-
-    //TODO handle
 }
 
 fn pointerLeave(data: ?*anyopaque, pointer: ?*c.wl_pointer, serial: u32, surface: ?*c.wl_surface) callconv(.c) void {
@@ -302,18 +331,16 @@ fn pointerLeave(data: ?*anyopaque, pointer: ?*c.wl_pointer, serial: u32, surface
     _ = pointer;
     _ = serial;
     _ = surface;
-
-    //TODO handle
 }
 
 fn pointerMotion(data: ?*anyopaque, pointer: ?*c.wl_pointer, time: u32, surface_x: c.wl_fixed_t, surface_y: c.wl_fixed_t) callconv(.c) void {
-    _ = data;
     _ = pointer;
     _ = time;
-    _ = surface_x;
-    _ = surface_y;
 
-    //TODO handle
+    const context: *Context = @ptrCast(@alignCast(data.?));
+
+    context.pointer_position_x = surface_x;
+    context.pointer_position_y = surface_y;
 }
 
 //TODO check std for values
@@ -338,7 +365,6 @@ fn pointerButton(data: ?*anyopaque, pointer: ?*c.wl_pointer, serial: u32, time: 
     const button: LinuxInputEvent = @enumFromInt(pointer_button);
     const state: WlPointerButtonState = @enumFromInt(pointer_state);
 
-    //TODO handle
     switch (state) {
         .pressed => {
             switch (button) {
@@ -383,14 +409,11 @@ fn pointerAxis(data: ?*anyopaque, pointer: ?*c.wl_pointer, time: u32, pointer_ax
 
     const axis: PointerAxis = @enumFromInt(pointer_axis);
     _ = axis;
-    //TODO handle
 }
 
 fn pointerFrame(data: ?*anyopaque, pointer: ?*c.wl_pointer) callconv(.c) void {
     _ = data;
     _ = pointer;
-
-    //TODO handle
 }
 
 //TODO replace by values from C
@@ -407,7 +430,6 @@ fn pointerAxisSource(data: ?*anyopaque, pointer: ?*c.wl_pointer, pointer_axis_so
 
     const axis_source: PointerAxisSource = @enumFromInt(pointer_axis_source);
     _ = axis_source;
-    //TODO handle
 }
 
 fn pointerAxisStop(data: ?*anyopaque, pointer: ?*c.wl_pointer, time: u32, pointer_axis: u32) callconv(.c) void {
@@ -417,7 +439,6 @@ fn pointerAxisStop(data: ?*anyopaque, pointer: ?*c.wl_pointer, time: u32, pointe
 
     const axis: PointerAxis = @enumFromInt(pointer_axis);
     _ = axis;
-    //TODO handle
 }
 
 fn pointerAxisValue120(data: ?*anyopaque, pointer: ?*c.wl_pointer, pointer_axis: u32, value: i32) callconv(.c) void {
@@ -427,8 +448,6 @@ fn pointerAxisValue120(data: ?*anyopaque, pointer: ?*c.wl_pointer, pointer_axis:
 
     const axis: PointerAxis = @enumFromInt(pointer_axis);
     _ = axis;
-
-    //TODO handle
 }
 
 //TODO replace by values from C
@@ -446,7 +465,6 @@ fn pointerAxisRelativeDirection(data: ?*anyopaque, pointer: ?*c.wl_pointer, poin
 
     const direction: PointerDirection = @enumFromInt(pointer_direction);
     _ = direction;
-    //TODO handle
 }
 
 //TODO replace by values from C
@@ -463,8 +481,6 @@ fn keyboardKeymap(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, keyboard_keymap_
 
     const keymap_format: KeyboardKeyState = @enumFromInt(keyboard_keymap_format);
     _ = keymap_format;
-
-    //TODO handle
 }
 
 fn keyboardEnter(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, surface: ?*c.wl_surface, keys: [*c]c.wl_array) callconv(.c) void {
@@ -473,8 +489,6 @@ fn keyboardEnter(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, surf
     _ = serial;
     _ = surface;
     _ = keys;
-
-    //TODO handle
 }
 
 fn keyboardLeave(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, surface: ?*c.wl_surface) callconv(.c) void {
@@ -482,8 +496,6 @@ fn keyboardLeave(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, surf
     _ = keyboard;
     _ = serial;
     _ = surface;
-
-    //TODO handle
 }
 
 //TODO replace by values from C
@@ -506,7 +518,6 @@ fn keyboardKey(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, time: 
         .pressed => std.log.debug("Pressed key: {d}\n", .{key}),
         .repeated => std.log.debug("Repeated key: {d}\n", .{key}),
     }
-    //TODO handle
 }
 
 fn keyboardModifiers(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, mods_depressed: u32, mods_latched: u32, mods_locked: u32, group: u32) callconv(.c) void {
@@ -517,8 +528,6 @@ fn keyboardModifiers(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, 
     _ = mods_latched;
     _ = mods_locked;
     _ = group;
-
-    //TODO handle
 }
 
 fn keyboardRepeatInfo(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, rate: i32, delay: i32) callconv(.c) void {
@@ -526,6 +535,16 @@ fn keyboardRepeatInfo(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, rate: i32, d
     _ = keyboard;
     _ = rate;
     _ = delay;
+}
 
-    //TODO handle
+pub fn draw(ctx: *Context) !void {
+    const buffer_context = &ctx.buffer_context.?;
+    const offset: i32 = @intCast(buffer_context.stride * buffer_context.heigth * buffer_context.index);
+    // std.debug.print("offset: {d}; index: {d}, xor_index: {d}, stride: {d}, width: {d}, heigth: {d}\n", .{offset, buffer_context.index, buffer_context.index ^ 1, buffer_context.stride, buffer_context.width, buffer_context.heigth});
+    buffer_context.index = buffer_context.index ^ 1;
+    const buffer = c.wl_shm_pool_create_buffer(buffer_context.shm_pool, offset, @intCast(buffer_context.width), @intCast(buffer_context.heigth), @intCast(buffer_context.stride), c.WL_SHM_FORMAT_ARGB8888);
+
+    c.wl_surface_attach(ctx.surface, buffer, 0, 0);
+    c.wl_surface_damage_buffer(ctx.surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
+    c.wl_surface_commit(ctx.surface);
 }
